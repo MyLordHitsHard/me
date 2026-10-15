@@ -4,11 +4,20 @@
   "description": "LifeOS — a multi-user career & life dashboard: skills, exams, workouts, notes, sketches, people, relations, analytics, SWOT and opt-in leaderboards.",
   "main": "server.js",
   "private": true,
-  "engines": { "node": ">=22.5" },
-  "scripts": {
-    "start": "node --no-warnings server.js",
-    "dev": "node --no-warnings --watch server.js",
-    "test": "node --no-warnings --test test/*.test.js"
+  "engines": {
+    "node": ">=20"
   },
-  "license": "MIT"
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js",
+    "test:pg": "TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://lifeos:lifeos@localhost:5432/lifeos_test} node --test test/*.test.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17"
+  }
 }
