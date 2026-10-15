@@ -1,0 +1,14 @@
+{
+  "name": "lifeos",
+  "version": "1.0.0",
+  "description": "LifeOS — a multi-user career & life dashboard: skills, exams, workouts, notes, sketches, people, relations, analytics, SWOT and opt-in leaderboards.",
+  "main": "server.js",
+  "private": true,
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "dev": "node --no-warnings --watch server.js",
+    "test": "node --no-warnings --test test/*.test.js"
+  },
+  "license": "MIT"
+}
