@@ -121,7 +121,9 @@ function thumb() {
 async function save(titleIn) {
   state.title = titleIn.value.trim() || 'Untitled sketch';
   let data = canvas.toDataURL('image/png');
-  if (data.length > 3800000) data = canvas.toDataURL('image/jpeg', 0.9);
+  // keep each save under hosting request limits (~4.5 MB on Vercel)
+  if (data.length > 3000000) data = canvas.toDataURL('image/jpeg', 0.9);
+  if (data.length > 3000000) data = canvas.toDataURL('image/jpeg', 0.7);
   const values = { title: state.title, data, thumb: thumb() };
   const row = await guard(() => (state.id ? store.update('sketches', state.id, values, { silent: true }) : store.create('sketches', values, { silent: true })), 'Sketch saved');
   if (row) {

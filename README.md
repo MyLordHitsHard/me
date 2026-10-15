@@ -26,23 +26,50 @@ Anyone can sign up and get their own dashboard. Joining **leaderboards** is opt-
 | **Leaderboards** | Opt-in boards per skill, per custom tracker and for activity (workout minutes, study hours, check-in streak…). Other members see only your display name, headline and score. |
 | **Settings** | Theme (system / light / dark), accent colour, currency, modules on/off, dashboard widgets, personal targets, JSON export / import, sample data, password change, account deletion. |
 
-## Run it
+## Run it locally
 
-Requires **Node.js 22.5+**. There are no npm dependencies: it uses the built-in `node:sqlite`, and Chart.js is vendored.
+Requires **Node.js 20+**.
 
 ```bash
+npm install
 npm start            # http://localhost:3000
-npm test             # API tests
+```
+
+If `DATABASE_URL` isn't set, LifeOS uses **PGlite**, an embedded Postgres stored in `data/pglite/`, so local runs need no setup. Set `DATABASE_URL` to use any real Postgres (local, Neon, Supabase…).
+
+```bash
+npm test             # API tests on embedded PGlite
+npm run test:pg      # same tests on a real Postgres (TEST_DATABASE_URL — the database is wiped!)
 ```
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `PORT` | `3000` | HTTP port |
-| `DB_PATH` | `data/lifeos.db` | SQLite database file |
+| `DATABASE_URL` | — | Postgres connection string (Neon: use the **pooled** one) |
+| `PGLITE_DIR` | `data/pglite` | Where embedded PGlite stores data when `DATABASE_URL` is unset |
+| `PORT` | `3000` | HTTP port (local server only) |
 | `ALLOW_SIGNUP` | `true` | Set to `false` to close registrations |
-| `COOKIE_SECURE` | auto | Force `Secure` cookies (auto-on behind an HTTPS proxy) |
+| `COOKIE_SECURE` | auto | Force `Secure` cookies (auto-on behind HTTPS) |
 
-To deploy (Render, Railway, Fly, a VPS…), run `npm start` on a host with a persistent disk for `DB_PATH`.
+## Deploy for free: Vercel + Neon Postgres
+
+The repo is ready to deploy as-is: `vercel.json` serves `public/` from Vercel's CDN, and `api/index.js` runs the API as a serverless function. Tables are created automatically on the first request.
+
+1. Sign in at **[vercel.com](https://vercel.com)** with GitHub, on the free **Hobby** plan.
+2. **Add New → Project** and import this repository. Leave the framework preset as **Other** and the build settings at their defaults.
+3. Before or after the first deploy, open the project's **Storage** tab, then **Create Database → Neon** (the free plan). Pick a region close to you and connect it to the project. This adds `DATABASE_URL` to the environment variables automatically.
+   *Alternative:* create a project at **[neon.tech](https://neon.tech)**, copy the **pooled** connection string, and add it in Vercel under **Settings → Environment Variables** as `DATABASE_URL`.
+4. **Redeploy** (Deployments → ⋯ → Redeploy) so the function picks up `DATABASE_URL`.
+5. Open `https://<your-project>.vercel.app/healthz`. It should return `{"ok":true}`. Then open the site and create your account.
+6. Optional: once your friends have signed up, set `ALLOW_SIGNUP=false` and redeploy.
+
+Every push to the production branch redeploys automatically.
+
+**Free-tier notes**
+
+- Vercel caps request bodies at about 4.5 MB. The app keeps each sketch below that and uploads sketch images one at a time during imports.
+- Neon's free database pauses when idle, so the first request after a quiet period can take a second or two.
+- The login rate limit is kept in memory per function instance, so it's weaker on serverless. That's fine for personal use.
+- Vercel Hobby is for non-commercial use.
 
 ### Load my profile
 
@@ -51,9 +78,11 @@ To deploy (Render, Railway, Fly, a VPS…), run `npm start` on a host with a per
 ## Architecture
 
 ```
-server.js              HTTP server: auth, generic CRUD, links, leaderboards, import/export, static files
+server.js              request handler: auth, generic CRUD, links, leaderboards, import/export, static files
+api/index.js           Vercel serverless entry (re-exports the handler)
+vercel.json            static output dir, API rewrites, security headers
 lib/schema.js          entity registry: one place that defines every table, field and validation rule
-lib/db.js              SQLite setup + automatic column migrations
+lib/db.js              Postgres (pg) / PGlite adapter, schema creation + automatic column migrations
 lib/leaderboards.js    opt-in rankings
 public/js/app.js       SPA shell, router, global search (press /)
 public/js/store.js     API client + in-memory store + relation helpers

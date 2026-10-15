@@ -87,7 +87,7 @@ function data() {
             let payload;
             try { payload = JSON.parse(await f.text()); } catch { return toast('That file is not valid JSON', 'error'); }
             if (mode.value === 'replace' && !(await confirmBox('Replace ALL your current data with this file?', 'Replace'))) return;
-            const r = await guard(() => api('POST', '/api/import', { payload, mode: mode.value, applyProfile: applyProfile.checked }));
+            const r = await guard(() => importInParts(payload, mode.value, applyProfile.checked));
             if (r) { await store.load(); toast(`Imported ${Object.values(r.counts).reduce((a, b) => a + b, 0)} records`); }
           },
         }, 'Import'))),
@@ -112,6 +112,19 @@ function account() {
           const ok = await guard(() => api('DELETE', '/api/me', { password: del.value }));
           if (ok) location.reload();
         } }, 'Delete my account'))));
+}
+
+// Hosts like Vercel cap request bodies (~4.5 MB), so sketch images travel one per request.
+async function importInParts(payload, mode, applyProfile) {
+  const sketches = (payload.data && Array.isArray(payload.data.sketches)) ? payload.data.sketches : [];
+  const images = new Map(sketches.map((sk) => [sk.id, { data: sk.data, thumb: sk.thumb }]));
+  const light = { ...payload, data: { ...(payload.data || {}), sketches: sketches.map(({ data: _d, thumb: _t, ...rest }) => rest) } };
+  const r = await api('POST', '/api/import', { payload: light, mode, applyProfile });
+  for (const [oldId, img] of images) {
+    const newId = r.ids && r.ids.sketches && r.ids.sketches[oldId];
+    if (newId && (img.data || img.thumb)) await api('PUT', `/api/sketches/${newId}`, { data: img.data ?? null, thumb: img.thumb ?? null });
+  }
+  return r;
 }
 
 let tab = 'profile';

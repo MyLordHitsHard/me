@@ -1,23 +1,27 @@
 'use strict';
 // LifeOS — a multi-user personal & career dashboard.
-// Zero runtime dependencies: Node >= 22.5 (built-in node:sqlite).
+// Runs as a plain Node server (`npm start`) or as a Vercel serverless function (api/index.js).
+// Storage: Postgres via DATABASE_URL (e.g. Neon), or embedded PGlite when unset.
 
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { open, tx } = require('./lib/db');
+const { open, NOW, q } = require('./lib/db');
 const { ENTITIES, LINKABLE, IMPORT_ORDER } = require('./lib/schema');
 const lb = require('./lib/leaderboards');
 
 const PORT = Number(process.env.PORT) || 3000;
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'lifeos.db');
 const PUBLIC = path.join(__dirname, 'public');
 const SESSION_DAYS = 30;
 const COOKIE = 'lifeos_sid';
 const ALLOW_SIGNUP = process.env.ALLOW_SIGNUP !== 'false';
+const TRUST_PROXY = !!process.env.VERCEL || process.env.TRUST_PROXY === 'true';
+// Vercel rejects request bodies above ~4.5 MB before they reach us; stay under it everywhere.
+const BODY_LIMIT = 4 * 1024 * 1024;
 
-const db = open(DB_PATH);
+let ready = null;
+const getDb = () => (ready ||= open().catch((e) => { ready = null; throw e; }));
 
 // ---------- helpers ----------
 class HttpError extends Error {
@@ -35,6 +39,24 @@ function send(res, status, body, headers = {}) {
 }
 
 function readBody(req, limit) {
+  // Vercel's Node runtime exposes a lazily parsed `req.body`; plain node:http doesn't.
+  if ('body' in req) {
+    let b;
+    try {
+      b = req.body;
+    } catch {
+      return Promise.reject(bad('Invalid JSON'));
+    }
+    if (b === undefined || b === null || b === '') return Promise.resolve({});
+    if (Buffer.isBuffer(b) || typeof b === 'string') {
+      try {
+        return Promise.resolve(JSON.parse(b.toString('utf8')));
+      } catch {
+        return Promise.reject(bad('Invalid JSON'));
+      }
+    }
+    if (typeof b === 'object') return Promise.resolve(b);
+  }
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -90,18 +112,17 @@ function sessionCookie(req, token, maxAge) {
   return `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${isSecure(req) ? '; Secure' : ''}`;
 }
 
-function createSession(userId) {
+async function createSession(db, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(sha256(token), userId, Date.now() + SESSION_DAYS * 86400000);
+  await db.run('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)', sha256(token), userId, Date.now() + SESSION_DAYS * 86400000);
   return token;
 }
 
-function currentUser(req) {
+async function currentUser(db, req) {
   const token = parseCookies(req)[COOKIE];
   if (!token) return null;
-  const row = db.prepare('SELECT u.* , s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?').get(sha256(token));
-  if (!row || row.expires_at < Date.now()) return null;
-  return row;
+  const row = await db.get('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?', sha256(token), Date.now());
+  return row || null;
 }
 
 function publicUser(u) {
@@ -112,22 +133,28 @@ function publicUser(u) {
   return { id: u.id, username: u.username, display_name: u.display_name, headline: u.headline || '', bio: u.bio || '', settings, created_at: u.created_at };
 }
 
-// Very small in-memory limiter for auth endpoints.
+function clientIp(req) {
+  if (TRUST_PROXY && req.headers['x-forwarded-for']) return String(req.headers['x-forwarded-for']).split(',')[0].trim();
+  return req.socket.remoteAddress || '?';
+}
+
+// Small in-memory limiter for auth endpoints (per server instance).
 const attempts = new Map();
 function rateLimit(req, key, max = 10, windowMs = 10 * 60 * 1000) {
-  const ip = req.socket.remoteAddress || '?';
-  const k = `${key}:${ip}`;
+  const k = `${key}:${clientIp(req)}`;
   const now = Date.now();
   const list = (attempts.get(k) || []).filter((t) => now - t < windowMs);
   if (list.length >= max) throw new HttpError(429, 'Too many attempts, try again in a few minutes');
   list.push(now);
   attempts.set(k, list);
+  if (attempts.size > 10000) attempts.clear();
 }
 
 // ---------- validation ----------
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const STAMP_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
-function coerce(entity, name, f, v, userId) {
+async function coerce(db, name, f, v, userId, trustRefs) {
   if (v === undefined) return undefined;
   if (v === null || v === '') {
     if (f.required) throw bad(`${name} is required`);
@@ -154,11 +181,13 @@ function coerce(entity, name, f, v, userId) {
       if (f.type === 'int') n = Math.round(n);
       if (f.min !== undefined && n < f.min) throw bad(`${name} must be ≥ ${f.min}`);
       if (f.max !== undefined && n > f.max) throw bad(`${name} must be ≤ ${f.max}`);
+      if (f.type === 'int' && Math.abs(n) > 2147483647) throw bad(`${name} is out of range`);
       return n;
     }
     case 'ref': {
       const id = Number(v);
-      if (!Number.isInteger(id) || !db.prepare(`SELECT 1 FROM ${f.ref} WHERE id = ? AND user_id = ?`).get(id, userId)) {
+      if (!Number.isInteger(id) || id <= 0 || id > 2147483647) throw bad(`${name} is invalid`);
+      if (!trustRefs && !(await db.get(`SELECT 1 FROM ${f.ref} WHERE id = ? AND user_id = ?`, id, userId))) {
         throw bad(`${name} refers to an unknown ${ENTITIES[f.ref].label.toLowerCase()}`);
       }
       return id;
@@ -167,97 +196,115 @@ function coerce(entity, name, f, v, userId) {
   throw bad(`Unsupported field ${name}`);
 }
 
-function validate(entity, body, userId, isCreate) {
+async function validate(db, entity, body, userId, isCreate, trustRefs = false) {
   const def = ENTITIES[entity];
   const out = {};
   for (const [name, f] of Object.entries(def.fields)) {
     let v = body[name];
     if (isCreate && (v === undefined || v === null || v === '') && f.default !== undefined) v = f.default;
     if (isCreate && f.required && (v === undefined || v === null || v === '')) throw bad(`${name} is required`);
-    const c = coerce(entity, name, f, v, userId);
+    const c = await coerce(db, name, f, v, userId, trustRefs);
     if (c !== undefined) out[name] = c;
   }
   return out;
 }
 
-const listColumns = (entity) => ['id', ...Object.entries(ENTITIES[entity].fields).filter(([, f]) => !f.heavy).map(([n]) => n), 'created_at', 'updated_at'].join(', ');
+const listColumns = (entity) => ['id', ...Object.entries(ENTITIES[entity].fields).filter(([, f]) => !f.heavy).map(([n]) => q(n)), 'created_at', 'updated_at'].join(', ');
 
-function insertRow(entity, userId, values) {
+async function insertRow(db, entity, userId, values) {
   const cols = Object.keys(values);
-  const sql = `INSERT INTO ${entity} (user_id${cols.map((c) => `, ${c}`).join('')}) VALUES (?${cols.map(() => ', ?').join('')})`;
-  const r = db.prepare(sql).run(userId, ...cols.map((c) => values[c]));
-  return Number(r.lastInsertRowid);
+  const r = await db.get(`INSERT INTO ${entity} (user_id${cols.map((c) => `, ${q(c)}`).join('')}) VALUES (?${cols.map(() => ', ?').join('')}) RETURNING id`, userId, ...cols.map((c) => values[c]));
+  return r.id;
 }
 
-function getRow(entity, id, userId, full) {
-  return db.prepare(`SELECT ${full ? '*' : listColumns(entity)} FROM ${entity} WHERE id = ? AND user_id = ?`).get(id, userId);
+const getRow = (db, entity, id, userId, full) => db.get(`SELECT ${full ? '*' : listColumns(entity)} FROM ${entity} WHERE id = ? AND user_id = ?`, id, userId);
+
+async function validLinkEnd(db, type, id, userId) {
+  return LINKABLE.includes(type) && Number.isInteger(id) && id > 0 && id <= 2147483647 && !!(await db.get(`SELECT 1 FROM ${type} WHERE id = ? AND user_id = ?`, id, userId));
 }
 
-function validLinkEnd(type, id, userId) {
-  return LINKABLE.includes(type) && Number.isInteger(id) && !!db.prepare(`SELECT 1 FROM ${type} WHERE id = ? AND user_id = ?`).get(id, userId);
-}
-
-function deleteLinksFor(entity, id, userId) {
-  db.prepare('DELETE FROM links WHERE user_id = ? AND ((from_type = ? AND from_id = ?) OR (to_type = ? AND to_id = ?))').run(userId, entity, id, entity, id);
-}
-
-function allData(userId, full) {
+async function allData(db, userId, full) {
+  const entities = Object.keys(ENTITIES);
+  const [rows, links] = await Promise.all([
+    Promise.all(entities.map((e) => db.all(`SELECT ${full ? '*' : listColumns(e)} FROM ${e} WHERE user_id = ? ORDER BY id`, userId))),
+    db.all('SELECT id, from_type, from_id, to_type, to_id, label FROM links WHERE user_id = ? ORDER BY id', userId),
+  ]);
   const data = {};
-  for (const e of Object.keys(ENTITIES)) {
-    data[e] = db.prepare(`SELECT ${full ? '*' : listColumns(e)} FROM ${e} WHERE user_id = ? ORDER BY id`).all(userId);
+  entities.forEach((e, i) => {
+    data[e] = rows[i];
     if (full) data[e].forEach((r) => delete r.user_id);
-  }
-  const links = db.prepare('SELECT id, from_type, from_id, to_type, to_id, label FROM links WHERE user_id = ? ORDER BY id').all(userId);
+  });
   return { data, links };
 }
 
-function importData(userId, payload, mode) {
+// Bulk import with id remapping. Ids are reserved up front so every table is
+// written with a handful of multi-row INSERTs instead of one round trip per row.
+async function importData(db, userId, payload, mode) {
   const src = (payload && payload.data) || {};
   const idMap = {};
   const counts = {};
-  tx(db, () => {
+  await db.tx(async (t) => {
     if (mode === 'replace') {
-      db.prepare('DELETE FROM links WHERE user_id = ?').run(userId);
-      for (const e of [...IMPORT_ORDER].reverse()) db.prepare(`DELETE FROM ${e} WHERE user_id = ?`).run(userId);
+      await t.run('DELETE FROM links WHERE user_id = ?', userId);
+      for (const e of [...IMPORT_ORDER].reverse()) await t.run(`DELETE FROM ${e} WHERE user_id = ?`, userId);
     }
     for (const e of IMPORT_ORDER) {
       idMap[e] = {};
       counts[e] = 0;
-      const rows = Array.isArray(src[e]) ? src[e] : [];
       const def = ENTITIES[e];
-      for (const row of rows) {
+      const fields = Object.keys(def.fields);
+      const prepared = [];
+      for (const row of Array.isArray(src[e]) ? src[e] : []) {
         if (!row || typeof row !== 'object') continue;
         const r = { ...row };
         let skip = false;
         for (const [n, f] of Object.entries(def.fields)) {
-          if (f.type === 'ref') {
-            const mapped = idMap[f.ref][r[n]];
-            if (!mapped) skip = true;
-            else r[n] = mapped;
-          }
+          if (f.type !== 'ref') continue;
+          const mapped = idMap[f.ref][r[n]];
+          if (!mapped) skip = true;
+          else r[n] = mapped;
         }
         if (skip) continue;
-        const values = validate(e, r, userId, true);
-        const newId = insertRow(e, userId, values);
-        if (row.id !== undefined) idMap[e][row.id] = newId;
-        counts[e]++;
+        prepared.push({ old: row.id, values: await validate(t, e, r, userId, true, true), created: STAMP_RE.test(row.created_at) ? row.created_at : null, updated: STAMP_RE.test(row.updated_at) ? row.updated_at : null });
       }
+      if (!prepared.length) continue;
+      const ids = (await t.all(`SELECT nextval(pg_get_serial_sequence('${e}', 'id'))::int AS id FROM generate_series(1, ?::int)`, prepared.length)).map((x) => x.id);
+      prepared.forEach((p, i) => {
+        p.id = ids[i];
+        if (p.old !== undefined && p.old !== null) idMap[e][p.old] = p.id;
+      });
+      const cols = ['id', 'user_id', ...fields.map(q), 'created_at', 'updated_at'];
+      const CHUNK = 200;
+      for (let i = 0; i < prepared.length; i += CHUNK) {
+        const params = [];
+        const tuples = prepared.slice(i, i + CHUNK).map((p) => {
+          params.push(p.id, userId, ...fields.map((f) => (p.values[f] === undefined ? null : p.values[f])));
+          const stamps = [p.created, p.updated].map((s) => (s ? (params.push(s), '?') : NOW));
+          return `(${['?', '?', ...fields.map(() => '?')].join(', ')}, ${stamps.join(', ')})`;
+        });
+        await t.run(`INSERT INTO ${e} (${cols.join(', ')}) VALUES ${tuples.join(', ')}`, ...params);
+      }
+      counts[e] = prepared.length;
     }
-    counts.links = 0;
+    const links = [];
     for (const l of Array.isArray(payload.links) ? payload.links : []) {
-      const from = idMap[l.from_type] && idMap[l.from_type][l.from_id];
-      const to = idMap[l.to_type] && idMap[l.to_type][l.to_id];
-      if (!from || !to || !LINKABLE.includes(l.from_type) || !LINKABLE.includes(l.to_type)) continue;
-      db.prepare('INSERT INTO links (user_id, from_type, from_id, to_type, to_id, label) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(userId, l.from_type, from, l.to_type, to, l.label ? String(l.label).slice(0, 100) : null);
-      counts.links++;
+      if (!l || !LINKABLE.includes(l.from_type) || !LINKABLE.includes(l.to_type)) continue;
+      const from = idMap[l.from_type][l.from_id];
+      const to = idMap[l.to_type][l.to_id];
+      if (from && to) links.push([userId, l.from_type, from, l.to_type, to, l.label ? String(l.label).slice(0, 100) : null]);
     }
+    for (let i = 0; i < links.length; i += 500) {
+      const chunk = links.slice(i, i + 500);
+      await t.run(`INSERT INTO links (user_id, from_type, from_id, to_type, to_id, label) VALUES ${chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')}`, ...chunk.flat());
+    }
+    counts.links = links.length;
   });
-  return counts;
+  return { counts, ids: { sketches: idMap.sketches } };
 }
 
 // ---------- API ----------
 async function api(req, res, url) {
+  const db = await getDb();
   const parts = url.pathname.split('/').filter(Boolean).slice(1); // drop "api"
   const method = req.method;
   const isMutation = method !== 'GET' && method !== 'HEAD';
@@ -265,8 +312,7 @@ async function api(req, res, url) {
   // CSRF defence: mutations must come from our own fetch() wrapper.
   if (isMutation && req.headers['x-lifeos'] !== '1') throw new HttpError(403, 'Missing request header');
 
-  const big = parts[0] === 'import' || parts[0] === 'sketches';
-  const body = isMutation ? await readBody(req, big ? 30 * 1024 * 1024 : 2 * 1024 * 1024) : {};
+  const body = isMutation ? await readBody(req, BODY_LIMIT) : {};
 
   // ---- auth (no session needed)
   if (parts[0] === 'auth') {
@@ -279,28 +325,29 @@ async function api(req, res, url) {
       const display = String(body.display_name || username).trim().slice(0, 80) || username;
       if (!/^[a-z0-9_.-]{3,32}$/.test(username)) throw bad('Username: 3–32 characters, letters, numbers, . _ -');
       if (password.length < 8) throw bad('Password must be at least 8 characters');
-      if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) throw new HttpError(409, 'That username is taken');
-      const r = db.prepare('INSERT INTO users (username, display_name, password_hash) VALUES (?, ?, ?)').run(username, display, hashPassword(password));
-      const token = createSession(Number(r.lastInsertRowid));
-      const u = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(r.lastInsertRowid));
+      if (password.length > 1000) throw bad('Password is too long');
+      const u = await db.get('INSERT INTO users (username, display_name, password_hash) VALUES (?, ?, ?) ON CONFLICT (username) DO NOTHING RETURNING *', username, display, hashPassword(password));
+      if (!u) throw new HttpError(409, 'That username is taken');
+      const token = await createSession(db, u.id);
       return send(res, 201, publicUser(u), { 'Set-Cookie': sessionCookie(req, token, SESSION_DAYS * 86400) });
     }
     if (parts[1] === 'login' && method === 'POST') {
       rateLimit(req, 'login', 10);
-      const u = db.prepare('SELECT * FROM users WHERE username = ?').get(String(body.username || '').trim().toLowerCase());
-      if (!u || !verifyPassword(String(body.password || ''), u.password_hash)) throw new HttpError(401, 'Wrong username or password');
-      const token = createSession(u.id);
+      const u = await db.get('SELECT * FROM users WHERE username = ?', String(body.username || '').trim().toLowerCase());
+      if (!u || !verifyPassword(String(body.password || '').slice(0, 1000), u.password_hash)) throw new HttpError(401, 'Wrong username or password');
+      await db.run('DELETE FROM sessions WHERE expires_at < ?', Date.now()); // housekeeping
+      const token = await createSession(db, u.id);
       return send(res, 200, publicUser(u), { 'Set-Cookie': sessionCookie(req, token, SESSION_DAYS * 86400) });
     }
     if (parts[1] === 'logout' && method === 'POST') {
       const token = parseCookies(req)[COOKIE];
-      if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+      if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
       return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
     }
     throw new HttpError(404, 'Not found');
   }
 
-  const user = currentUser(req);
+  const user = await currentUser(db, req);
   if (!user) throw new HttpError(401, 'Please log in');
   const uid = user.id;
 
@@ -321,21 +368,23 @@ async function api(req, res, url) {
         upd.settings = s;
       }
       const cols = Object.keys(upd);
-      if (cols.length) db.prepare(`UPDATE users SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`).run(...cols.map((c) => upd[c]), uid);
-      return send(res, 200, publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(uid)));
+      if (cols.length) await db.run(`UPDATE users SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`, ...cols.map((c) => upd[c]), uid);
+      return send(res, 200, publicUser(await db.get('SELECT * FROM users WHERE id = ?', uid)));
     }
     if (parts[1] === 'password' && method === 'PUT') {
       rateLimit(req, 'password', 10);
-      if (!verifyPassword(String(body.current || ''), user.password_hash)) throw new HttpError(401, 'Current password is wrong');
-      if (String(body.next || '').length < 8) throw bad('New password must be at least 8 characters');
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(String(body.next)), uid);
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
-      const token = createSession(uid);
+      if (!verifyPassword(String(body.current || '').slice(0, 1000), user.password_hash)) throw new HttpError(401, 'Current password is wrong');
+      const next = String(body.next || '');
+      if (next.length < 8) throw bad('New password must be at least 8 characters');
+      if (next.length > 1000) throw bad('Password is too long');
+      await db.run('UPDATE users SET password_hash = ? WHERE id = ?', hashPassword(next), uid);
+      await db.run('DELETE FROM sessions WHERE user_id = ?', uid);
+      const token = await createSession(db, uid);
       return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, SESSION_DAYS * 86400) });
     }
     if (parts.length === 1 && method === 'DELETE') {
-      if (!verifyPassword(String(body.password || ''), user.password_hash)) throw new HttpError(401, 'Password is wrong');
-      db.prepare('DELETE FROM users WHERE id = ?').run(uid);
+      if (!verifyPassword(String(body.password || '').slice(0, 1000), user.password_hash)) throw new HttpError(401, 'Password is wrong');
+      await db.run('DELETE FROM users WHERE id = ?', uid);
       return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
     }
     throw new HttpError(404, 'Not found');
@@ -343,23 +392,23 @@ async function api(req, res, url) {
 
   if (parts[0] === 'schema' && method === 'GET') return send(res, 200, { entities: ENTITIES, linkable: LINKABLE });
   if (parts[0] === 'bootstrap' && method === 'GET') {
-    return send(res, 200, { user: publicUser(user), ...allData(uid, false) });
+    return send(res, 200, { user: publicUser(user), ...(await allData(db, uid, false)) });
   }
   if (parts[0] === 'export' && method === 'GET') {
-    const { data, links } = allData(uid, true);
+    const { data, links } = await allData(db, uid, true);
     return send(res, 200, { app: 'lifeos', version: 1, exported_at: new Date().toISOString(), profile: publicUser(user), data, links }, {
       'Content-Disposition': `attachment; filename="lifeos-${user.username}.json"`,
     });
   }
   if (parts[0] === 'import' && method === 'POST') {
     const mode = body.mode === 'replace' ? 'replace' : 'merge';
-    const counts = importData(uid, body.payload || {}, mode);
+    const result = await importData(db, uid, body.payload || {}, mode);
     if (body.payload && body.payload.profile && body.applyProfile) {
       const p = body.payload.profile;
-      db.prepare('UPDATE users SET display_name = COALESCE(?, display_name), headline = ?, bio = ? WHERE id = ?')
-        .run(p.display_name ? String(p.display_name).slice(0, 80) : null, String(p.headline || '').slice(0, 200), String(p.bio || '').slice(0, 5000), uid);
+      await db.run('UPDATE users SET display_name = COALESCE(?, display_name), headline = ?, bio = ? WHERE id = ?',
+        p.display_name ? String(p.display_name).slice(0, 80) : null, String(p.headline || '').slice(0, 200), String(p.bio || '').slice(0, 5000), uid);
     }
-    return send(res, 200, { ok: true, counts });
+    return send(res, 200, { ok: true, ...result });
   }
 
   // ---- links (relations between any two linkable records)
@@ -367,17 +416,19 @@ async function api(req, res, url) {
     if (method === 'POST' && parts.length === 1) {
       const fromId = Number(body.from_id);
       const toId = Number(body.to_id);
-      if (!validLinkEnd(body.from_type, fromId, uid) || !validLinkEnd(body.to_type, toId, uid)) throw bad('Invalid link target');
+      if (!(await validLinkEnd(db, body.from_type, fromId, uid)) || !(await validLinkEnd(db, body.to_type, toId, uid))) throw bad('Invalid link target');
       if (body.from_type === body.to_type && fromId === toId) throw bad('Cannot link a record to itself');
-      const dup = db.prepare(`SELECT id FROM links WHERE user_id = ? AND ((from_type=? AND from_id=? AND to_type=? AND to_id=?) OR (from_type=? AND from_id=? AND to_type=? AND to_id=?))`)
-        .get(uid, body.from_type, fromId, body.to_type, toId, body.to_type, toId, body.from_type, fromId);
+      const dup = await db.get(`SELECT id FROM links WHERE user_id = ? AND ((from_type=? AND from_id=? AND to_type=? AND to_id=?) OR (from_type=? AND from_id=? AND to_type=? AND to_id=?))`,
+        uid, body.from_type, fromId, body.to_type, toId, body.to_type, toId, body.from_type, fromId);
       if (dup) throw new HttpError(409, 'Already linked');
       const label = body.label ? String(body.label).slice(0, 100) : null;
-      const r = db.prepare('INSERT INTO links (user_id, from_type, from_id, to_type, to_id, label) VALUES (?, ?, ?, ?, ?, ?)').run(uid, body.from_type, fromId, body.to_type, toId, label);
-      return send(res, 201, { id: Number(r.lastInsertRowid), from_type: body.from_type, from_id: fromId, to_type: body.to_type, to_id: toId, label });
+      const r = await db.get('INSERT INTO links (user_id, from_type, from_id, to_type, to_id, label) VALUES (?, ?, ?, ?, ?, ?) RETURNING id', uid, body.from_type, fromId, body.to_type, toId, label);
+      return send(res, 201, { id: r.id, from_type: body.from_type, from_id: fromId, to_type: body.to_type, to_id: toId, label });
     }
     if (method === 'DELETE' && parts.length === 2) {
-      db.prepare('DELETE FROM links WHERE id = ? AND user_id = ?').run(Number(parts[1]), uid);
+      const id = Number(parts[1]);
+      if (!Number.isInteger(id) || id <= 0 || id > 2147483647) throw new HttpError(404, 'Not found');
+      await db.run('DELETE FROM links WHERE id = ? AND user_id = ?', id, uid);
       return send(res, 200, { ok: true });
     }
     throw new HttpError(404, 'Not found');
@@ -385,65 +436,63 @@ async function api(req, res, url) {
 
   // ---- leaderboards
   if (parts[0] === 'leaderboards') {
-    if (parts.length === 1 && method === 'GET') return send(res, 200, lb.list(db, uid));
-    const key = decodeURIComponent(parts[1] || '');
-    const k = lb.parseKey(key);
+    if (parts.length === 1 && method === 'GET') return send(res, 200, await lb.list(db, uid));
+    const k = lb.parseKey(decodeURIComponent(parts[1] || ''));
     if (!k) throw new HttpError(404, 'Unknown leaderboard');
     const canonical = `${k.kind}:${k.name}`;
-    if (parts.length === 2 && method === 'GET') return send(res, 200, lb.board(db, canonical, uid));
+    if (parts.length === 2 && method === 'GET') return send(res, 200, await lb.board(db, canonical, uid));
     if (parts[2] === 'join' && method === 'POST') {
-      if (!lb.eligible(db, k, uid)) throw bad(`Add this ${k.kind} to your dashboard before joining its leaderboard`);
-      db.prepare('INSERT OR IGNORE INTO leaderboard_members (user_id, board_key) VALUES (?, ?)').run(uid, canonical);
-      return send(res, 200, lb.board(db, canonical, uid));
+      if (!(await lb.eligible(db, k, uid))) throw bad(`Add this ${k.kind} to your dashboard before joining its leaderboard`);
+      await db.run('INSERT INTO leaderboard_members (user_id, board_key) VALUES (?, ?) ON CONFLICT DO NOTHING', uid, canonical);
+      return send(res, 200, await lb.board(db, canonical, uid));
     }
     if (parts[2] === 'join' && method === 'DELETE') {
-      db.prepare('DELETE FROM leaderboard_members WHERE user_id = ? AND board_key = ?').run(uid, canonical);
-      return send(res, 200, lb.board(db, canonical, uid));
+      await db.run('DELETE FROM leaderboard_members WHERE user_id = ? AND board_key = ?', uid, canonical);
+      return send(res, 200, await lb.board(db, canonical, uid));
     }
     throw new HttpError(404, 'Not found');
   }
 
   // ---- generic CRUD for every entity
   const entity = parts[0];
-  if (!ENTITIES[entity]) throw new HttpError(404, 'Not found');
+  if (!Object.prototype.hasOwnProperty.call(ENTITIES, entity)) throw new HttpError(404, 'Not found');
   const id = parts[1] !== undefined ? Number(parts[1]) : null;
-  if (parts.length > 2 || (id !== null && !Number.isInteger(id))) throw new HttpError(404, 'Not found');
+  if (parts.length > 2 || (id !== null && (!Number.isInteger(id) || id <= 0 || id > 2147483647))) throw new HttpError(404, 'Not found');
 
   if (method === 'GET' && id === null) {
-    return send(res, 200, db.prepare(`SELECT ${listColumns(entity)} FROM ${entity} WHERE user_id = ? ORDER BY id`).all(uid));
+    return send(res, 200, await db.all(`SELECT ${listColumns(entity)} FROM ${entity} WHERE user_id = ? ORDER BY id`, uid));
   }
   if (method === 'GET') {
-    const row = getRow(entity, id, uid, true);
+    const row = await getRow(db, entity, id, uid, true);
     if (!row) throw new HttpError(404, 'Not found');
     delete row.user_id;
     return send(res, 200, row);
   }
   if (method === 'POST' && id === null) {
-    const values = validate(entity, body, uid, true);
-    const newId = insertRow(entity, uid, values);
-    return send(res, 201, getRow(entity, newId, uid, false));
+    const values = await validate(db, entity, body, uid, true);
+    const newId = await insertRow(db, entity, uid, values);
+    return send(res, 201, await getRow(db, entity, newId, uid, false));
   }
   if (method === 'PUT' && id !== null) {
-    if (!getRow(entity, id, uid, false)) throw new HttpError(404, 'Not found');
-    const values = validate(entity, body, uid, false);
+    if (!(await getRow(db, entity, id, uid, false))) throw new HttpError(404, 'Not found');
+    const values = await validate(db, entity, body, uid, false);
     const cols = Object.keys(values);
     if (cols.length) {
-      db.prepare(`UPDATE ${entity} SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ? AND user_id = ?`)
-        .run(...cols.map((c) => values[c]), id, uid);
+      await db.run(`UPDATE ${entity} SET ${cols.map((c) => `${q(c)} = ?`).join(', ')}, updated_at = ${NOW} WHERE id = ? AND user_id = ?`, ...cols.map((c) => values[c]), id, uid);
     }
-    return send(res, 200, getRow(entity, id, uid, false));
+    return send(res, 200, await getRow(db, entity, id, uid, false));
   }
   if (method === 'DELETE' && id !== null) {
-    tx(db, () => {
-      deleteLinksFor(entity, id, uid);
-      db.prepare(`DELETE FROM ${entity} WHERE id = ? AND user_id = ?`).run(id, uid);
+    await db.tx(async (t) => {
+      await t.run('DELETE FROM links WHERE user_id = ? AND ((from_type = ? AND from_id = ?) OR (to_type = ? AND to_id = ?))', uid, entity, id, entity, id);
+      await t.run(`DELETE FROM ${entity} WHERE id = ? AND user_id = ?`, id, uid);
     });
     return send(res, 200, { ok: true });
   }
   throw new HttpError(405, 'Method not allowed');
 }
 
-// ---------- static files ----------
+// ---------- static files (local server only; on Vercel the CDN serves public/) ----------
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.md': 'text/plain; charset=utf-8',
@@ -457,7 +506,13 @@ const SECURITY_HEADERS = {
 };
 
 function serveStatic(req, res, url) {
-  let rel = decodeURIComponent(url.pathname);
+  let rel;
+  try {
+    rel = decodeURIComponent(url.pathname);
+  } catch {
+    res.writeHead(400);
+    return res.end();
+  }
   if (rel === '/' || !path.extname(rel)) rel = '/index.html';
   const file = path.normalize(path.join(PUBLIC, rel));
   if (!file.startsWith(PUBLIC + path.sep)) {
@@ -474,10 +529,13 @@ function serveStatic(req, res, url) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+async function handler(req, res) {
   const url = new URL(req.url, 'http://localhost');
   try {
-    if (url.pathname === '/healthz') return send(res, 200, { ok: true });
+    if (url.pathname === '/healthz' || url.pathname === '/api/healthz') {
+      await (await getDb()).get('SELECT 1 AS ok');
+      return send(res, 200, { ok: true });
+    }
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     serveStatic(req, res, url);
   } catch (e) {
@@ -485,12 +543,13 @@ const server = http.createServer(async (req, res) => {
     console.error(e);
     send(res, 500, { error: 'Something went wrong' });
   }
-});
+}
 
-// Purge expired sessions hourly.
-setInterval(() => db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now()), 3600000).unref();
+const server = http.createServer(handler);
 
 if (require.main === module) {
-  server.listen(PORT, () => console.log(`LifeOS running on http://localhost:${PORT}`));
+  getDb()
+    .then((db) => server.listen(PORT, () => console.log(`LifeOS running on http://localhost:${PORT} (${db.kind})`)))
+    .catch((e) => { console.error('Database connection failed:', e.message); process.exit(1); });
 }
-module.exports = { server, db };
+module.exports = { handler, server, getDb };

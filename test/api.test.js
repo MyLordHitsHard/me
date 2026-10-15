@@ -1,17 +1,26 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const path = require('node:path');
-const os = require('node:os');
-const fs = require('node:fs');
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lifeos-'));
-process.env.DB_PATH = path.join(dir, 'test.db');
-const { server } = require('../server');
+// Runs against embedded PGlite by default, or a real Postgres when TEST_DATABASE_URL is set
+// (the database is wiped first — never point this at real data).
+if (process.env.TEST_DATABASE_URL) process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+else { delete process.env.DATABASE_URL; delete process.env.POSTGRES_URL; process.env.PGLITE_DIR = 'memory://'; }
+const { server, getDb } = require('../server');
 
 let base;
-test.before(() => new Promise((r) => server.listen(0, () => { base = `http://127.0.0.1:${server.address().port}`; r(); })));
-test.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+test.before(async () => {
+  if (process.env.TEST_DATABASE_URL) {
+    const { Client } = require('pg');
+    const c = new Client({ connectionString: process.env.TEST_DATABASE_URL });
+    await c.connect();
+    await c.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    await c.end();
+  }
+  await getDb();
+  await new Promise((r) => server.listen(0, () => { base = `http://127.0.0.1:${server.address().port}`; r(); }));
+});
+test.after(async () => { server.close(); await (await getDb()).close(); });
 
 function client() {
   let cookie = '';
@@ -75,6 +84,11 @@ test('auth, CRUD, ownership, links, leaderboards, import/export', async () => {
   const imp = await b('POST', '/api/import', { payload: exp, mode: 'merge' });
   assert.equal(imp.body.counts.links, 1);
   assert.equal(imp.body.counts.skill_logs, 1);
+  const newSketch = imp.body.ids.sketches[sketch.id];
+  assert.ok(newSketch);
+  assert.equal((await b('GET', `/api/sketches/${newSketch}`)).body.data, 'data:image/png;base64,AAAA');
+  const bobNotes = (await b('GET', '/api/bootstrap')).body.data.skills.find((k) => k.name === 'Python');
+  assert.equal(bobNotes.created_at, exp.data.skills[0].created_at); // timestamps survive import
   const boot = (await b('GET', '/api/bootstrap')).body;
   assert.equal(boot.data.skills.length, 2);
   assert.equal(boot.links.length, 1);
@@ -89,4 +103,36 @@ test('auth, CRUD, ownership, links, leaderboards, import/export', async () => {
   assert.equal((await a('PUT', '/api/me/password', { current: 'password123', next: 'newpassword1' })).status, 200);
   assert.equal((await a('DELETE', '/api/me', { password: 'newpassword1' })).status, 200);
   assert.equal((await a('GET', '/api/me')).status, 401);
+});
+
+test('bulk import is fast and keeps parent/child ids straight', async () => {
+  const c = client();
+  await c('POST', '/api/auth/register', { username: 'bulk', password: 'password123' });
+  const data = { workouts: [], workout_sets: [], checkins: [] };
+  for (let i = 1; i <= 400; i++) {
+    data.workouts.push({ id: 1000 + i, date: '2026-01-01', type: 'strength', duration: i });
+    data.workout_sets.push({ id: i, workout_id: 1000 + i, exercise: `ex${i}`, sets: 3 });
+    data.workout_sets.push({ id: 5000 + i, workout_id: 1000 + i, exercise: `ex${i}`, sets: 4 });
+    data.checkins.push({ id: i, date: '2026-01-01', mood: (i % 5) + 1 });
+  }
+  data.workout_sets.push({ id: 99999, workout_id: 424242, exercise: 'orphan' }); // dangling ref is skipped
+  const t0 = Date.now();
+  const r = await c('POST', '/api/import', { payload: { data }, mode: 'replace' });
+  assert.equal(r.status, 200);
+  assert.deepEqual([r.body.counts.workouts, r.body.counts.workout_sets, r.body.counts.checkins], [400, 800, 400]);
+  assert.ok(Date.now() - t0 < 10000, 'import took too long');
+  const boot = (await c('GET', '/api/bootstrap')).body.data;
+  const byId = new Map(boot.workouts.map((w) => [w.id, w]));
+  for (const s of boot.workout_sets) assert.equal(`ex${byId.get(s.workout_id).duration}`, s.exercise);
+
+  // leaderboard metrics aggregate correctly (COUNT/SUM come back as numbers)
+  await c('POST', '/api/workouts', { date: new Date().toISOString().slice(0, 10), duration: 45 });
+  const lb = (await c('POST', '/api/leaderboards/metric:workouts_30d/join')).body;
+  assert.strictEqual(lb.rows[0].score, 1);
+  const list = (await c('GET', '/api/leaderboards')).body;
+  assert.strictEqual(list.find((x) => x.key === 'metric:workouts_30d').members, 1);
+
+  // erase everything
+  await c('POST', '/api/import', { payload: { data: {} }, mode: 'replace' });
+  assert.equal((await c('GET', '/api/bootstrap')).body.data.workouts.length, 0);
 });
