@@ -146,17 +146,6 @@ export const CHILDREN = {
   trackers: { type: 'tracker_logs', fk: 'tracker_id', cols: ['date', 'value', 'note'], label: 'Entries' },
 };
 
-// Keep parent records in sync when a child is logged.
-export async function afterChildAdded(type, row) {
-  if (type === 'skill_logs' && row.level !== null && row.level !== undefined) {
-    await store.update('skills', row.skill_id, { level: row.level }, { silent: true });
-  }
-  if (type === 'interactions') {
-    const p = store.get('people', row.person_id);
-    if (p && (!p.last_contact || p.last_contact < row.date)) await store.update('people', p.id, { last_contact: row.date }, { silent: true });
-  }
-}
-
 function childSection(parentType, parent) {
   const cfg = CHILDREN[parentType];
   const def = store.schema.entities[cfg.type];
@@ -177,7 +166,7 @@ function childSection(parentType, parent) {
         const values = { [cfg.fk]: parent.id };
         for (const [n, { el, f }] of Object.entries(inputs)) values[n] = readInput(el, f);
         const row = await guard(() => store.create(cfg.type, values, { silent: true }));
-        if (row) { await afterChildAdded(cfg.type, row); store.emit(); render(); }
+        if (row) { store.emit(); render(); }
       },
     }, 'Add')));
     wrap.append(
@@ -270,7 +259,6 @@ export function openRecord(type, item, { defaults = {}, onSaved, omit } = {}) {
       const values = form.values();
       const row = await guard(() => (isNew ? store.create(type, values) : store.update(type, item.id, values)), isNew ? 'Created' : 'Saved');
       if (!row) return false;
-      if (isNew) await afterChildAdded(type, row);
       if (onSaved) onSaved(row);
       if (isNew && (CHILDREN[type] || store.schema.linkable.includes(type)) && type !== 'notes') {
         setTimeout(() => openRecord(type, row), 50); // continue with logs & connections
@@ -338,7 +326,7 @@ export function chart(type, { labels, datasets, options = {}, height = '', horiz
     stacked,
     grid: { color: isValue ? grid : 'transparent', drawTicks: false },
     border: { display: !isValue, color: cssVar('--axis') },
-    ticks: { color: muted, padding: 6, font: { size: 11 }, maxRotation: 0, autoSkipPadding: 12 },
+    ticks: { color: muted, padding: 6, font: { size: 11 }, maxRotation: 0, autoSkipPadding: 12, autoSkip: !(horizontal && !isValue) },
     ...(isValue ? { beginAtZero: true, max: yMax, min: yMin } : {}),
   });
   const config = {

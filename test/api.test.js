@@ -60,10 +60,29 @@ test('auth, CRUD, ownership, links, leaderboards, import/export', async () => {
   assert.equal((await b('POST', '/api/skill_logs', { skill_id: skill.id, date: '2026-10-01' })).status, 400);
   assert.equal((await b('GET', '/api/skills')).body.length, 0);
 
+  // parent sync: a practice log with a level updates the skill in the same request
+  const logged = (await a('POST', '/api/skill_logs', { skill_id: skill.id, date: '2026-10-02', minutes: 30, level: 72 })).body;
+  assert.equal(logged._parent.type, 'skills');
+  assert.equal(logged._parent.row.level, 72);
+  assert.equal((await a('PUT', `/api/skills/${skill.id}`, { level: 70 })).body.level, 70);
+  assert.equal((await a('PUT', '/api/skills/999999', { level: 1 })).status, 404);
+  assert.equal((await a('PUT', `/api/skill_logs/${logged.id}`, { skill_id: 999999 })).status, 400);
+  assert.equal((await a('PUT', `/api/skills/${skill.id}`, {})).body.level, 70);
+
   const person = (await a('POST', '/api/people', { name: 'Mentor Mike', relation: 'mentor' })).body;
   const link = await a('POST', '/api/links', { from_type: 'people', from_id: person.id, to_type: 'skills', to_id: skill.id, label: 'teaches' });
   assert.equal(link.status, 201);
   assert.equal((await a('POST', '/api/links', { from_type: 'skills', from_id: skill.id, to_type: 'people', to_id: person.id })).status, 409);
+  const bobSkill = (await b('POST', '/api/skills', { name: 'Bob only' })).body;
+  assert.equal((await a('POST', '/api/links', { from_type: 'skills', from_id: skill.id, to_type: 'skills', to_id: bobSkill.id })).status, 400);
+  assert.equal((await a('POST', '/api/links', { from_type: 'users', from_id: 1, to_type: 'skills', to_id: skill.id })).status, 400);
+  const met = (await a('POST', '/api/interactions', { person_id: person.id, date: '2026-10-03', kind: 'call' })).body;
+  assert.equal(met._parent.row.last_contact, '2026-10-03');
+  const older = (await a('POST', '/api/interactions', { person_id: person.id, date: '2026-01-01' })).body;
+  assert.equal(older._parent, undefined); // older interaction doesn't move last_contact back
+  const boot0 = (await a('GET', '/api/bootstrap')).body;
+  assert.ok(boot0.schema.entities.skills && boot0.user.username === 'alice');
+  assert.equal(boot0.data.interactions.length, 2);
 
   const sketch = (await a('POST', '/api/sketches', { title: 's', data: 'data:image/png;base64,AAAA', thumb: 't' })).body;
   assert.equal(sketch.data, undefined); // heavy field not in list responses
@@ -83,14 +102,14 @@ test('auth, CRUD, ownership, links, leaderboards, import/export', async () => {
   const exp = (await a('GET', '/api/export')).body;
   const imp = await b('POST', '/api/import', { payload: exp, mode: 'merge' });
   assert.equal(imp.body.counts.links, 1);
-  assert.equal(imp.body.counts.skill_logs, 1);
+  assert.equal(imp.body.counts.skill_logs, 2);
   const newSketch = imp.body.ids.sketches[sketch.id];
   assert.ok(newSketch);
   assert.equal((await b('GET', `/api/sketches/${newSketch}`)).body.data, 'data:image/png;base64,AAAA');
   const bobNotes = (await b('GET', '/api/bootstrap')).body.data.skills.find((k) => k.name === 'Python');
   assert.equal(bobNotes.created_at, exp.data.skills[0].created_at); // timestamps survive import
   const boot = (await b('GET', '/api/bootstrap')).body;
-  assert.equal(boot.data.skills.length, 2);
+  assert.equal(boot.data.skills.length, 3);
   assert.equal(boot.links.length, 1);
 
   // deleting a record removes its links and children

@@ -163,7 +163,7 @@ tr.click:hover td { background: var(--surface-2); }
 .empty { text-align: center; color: var(--muted); padding: 24px 12px; }
 .empty button { margin-top: 10px; }
 
-.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); white-space: nowrap; }
+.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .chip.link { cursor: pointer; }
 .chip .x { cursor: pointer; opacity: .6; margin-left: 2px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }

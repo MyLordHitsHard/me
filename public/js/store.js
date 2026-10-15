@@ -78,11 +78,8 @@ export const store = {
   },
 
   async load() {
-    const [schema, boot] = await Promise.all([
-      this.schema ? Promise.resolve(this.schema) : api('GET', '/api/schema'),
-      api('GET', '/api/bootstrap'),
-    ]);
-    this.schema = schema;
+    const boot = await api('GET', '/api/bootstrap'); // one request, one DB query
+    this.schema = boot.schema;
     this.user = boot.user;
     this.data = boot.data;
     this.links = boot.links;
@@ -98,6 +95,12 @@ export const store = {
 
   async create(type, values, { silent } = {}) {
     const row = await api('POST', `/api/${type}`, values);
+    if (row._parent) {
+      // the server also updated the parent (e.g. a practice log's level → the skill)
+      const { type: pt, row: pr } = row._parent;
+      this.data[pt] = this.list(pt).map((r) => (r.id === pr.id ? pr : r));
+      delete row._parent;
+    }
     this.data[type] = [...this.list(type), row];
     if (!silent) this.emit();
     return row;
@@ -110,10 +113,32 @@ export const store = {
   },
   async remove(type, id) {
     await api('DELETE', `/api/${type}/${id}`);
-    // Server cascades children & links; mirror that locally by reloading.
-    await this.load();
+    // Mirror the server's cascade locally instead of reloading everything.
+    this.data[type] = this.list(type).filter((r) => r.id !== id);
+    for (const [child, def] of Object.entries(this.schema.entities)) {
+      for (const [field, f] of Object.entries(def.fields)) {
+        if (f.type === 'ref' && f.ref === type) this.data[child] = this.list(child).filter((r) => r[field] !== id);
+      }
+    }
+    this.links = this.links.filter((l) => !((l.from_type === type && l.from_id === id) || (l.to_type === type && l.to_id === id)));
+    this.emit();
   },
   async fetchFull(type, id) { return api('GET', `/api/${type}/${id}`); },
+
+  // Leaderboard list, cached briefly: skills/trackers pages only need "which boards did I join?".
+  boardsCache: null,
+  async boards({ fresh } = {}) {
+    if (!fresh && this.boardsCache && Date.now() - this.boardsCache.at < 60000) return this.boardsCache.list;
+    const list = await api('GET', '/api/leaderboards');
+    this.boardsCache = { at: Date.now(), list };
+    return list;
+  },
+  async setBoard(key, join) {
+    const board = await api(join ? 'POST' : 'DELETE', `/api/leaderboards/${encodeURIComponent(key)}/join`);
+    this.boardsCache = null;
+    this.emit();
+    return board;
+  },
 
   async link(fromType, fromId, toType, toId, label) {
     const l = await api('POST', '/api/links', { from_type: fromType, from_id: fromId, to_type: toType, to_id: toId, label });
