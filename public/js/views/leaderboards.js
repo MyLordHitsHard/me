@@ -8,15 +8,19 @@ let selected = null;
 
 export default {
   async render({ params }) {
-    const boards = await api('GET', '/api/leaderboards');
-    selected = params.get('b') || selected || (boards.find((b) => b.joined) || boards[0])?.key;
-    const board = selected ? await api('GET', `/api/leaderboards/${encodeURIComponent(selected)}`).catch(() => null) : null;
+    const fetchBoard = (key) => api('GET', `/api/leaderboards/${encodeURIComponent(key)}`).catch(() => null);
+    selected = params.get('b') || selected;
+    // fetch the list and the open board in parallel when we already know which board to show
+    let [boards, board] = await Promise.all([store.boards({ fresh: true }), selected ? fetchBoard(selected) : null]);
+    if (!selected) {
+      selected = (boards.find((b) => b.joined) || boards[0])?.key;
+      board = selected ? await fetchBoard(selected) : null;
+    }
     const groups = [['metric', 'Activity boards'], ['skill', 'Skill boards'], ['tracker', 'Custom tracker boards']];
 
     const toggle = async (b) => {
-      await guard(() => api(b.joined ? 'DELETE' : 'POST', `/api/leaderboards/${encodeURIComponent(b.key)}/join`), b.joined ? 'You left the leaderboard' : 'You joined — good luck!');
       selected = b.key;
-      store.emit();
+      await guard(() => store.setBoard(b.key, !b.joined), b.joined ? 'You left the leaderboard' : 'You joined — good luck!');
     };
 
     const list = h('div', null, groups.map(([kind, label]) => {

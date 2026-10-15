@@ -64,10 +64,32 @@ The repo is ready to deploy as-is: `vercel.json` serves `public/` from Vercel's 
 
 Every push to the production branch redeploys automatically.
 
+### Make it fast: put the function next to the database
+
+This matters most for speed. Every API call talks to the database, so the Vercel function and the Neon database **must be in the same region**. Vercel runs functions in Washington DC (`iad1`) by default. If your Neon database is in Singapore, each database round trip crosses the planet (about 200+ ms) and pages feel slow.
+
+1. In Neon, check your project's region: **Project settings → Region**, or look in the host name of the connection string, e.g. `….ap-southeast-1.aws.neon.tech`.
+2. In Vercel, go to **Project → Settings → Functions → Function Region**, select the matching region, and redeploy:
+
+| Neon region | Vercel function region |
+|---|---|
+| `aws-us-east-1` (N. Virginia) | `iad1` (Washington DC) |
+| `aws-us-east-2` (Ohio) | `cle1` (Cleveland) |
+| `aws-us-west-2` (Oregon) | `pdx1` (Portland) |
+| `aws-eu-central-1` (Frankfurt) | `fra1` (Frankfurt) |
+| `aws-eu-west-2` (London) | `lhr1` (London) |
+| `aws-ap-southeast-1` (Singapore) | `sin1` (Singapore), the closest pair to India |
+| `aws-ap-southeast-2` (Sydney) | `syd1` (Sydney) |
+| `aws-sa-east-1` (São Paulo) | `gru1` (São Paulo) |
+
+3. Check `https://<your-project>.vercel.app/healthz`. `functionRegion` should match `databaseRegion`, and `dbRoundTripMs` should be in single digits. Every API response also carries a `Server-Timing` header, visible in the browser DevTools Network tab.
+
+The server is built to need about one database round trip per request: sessions are cached briefly in memory, writes are single statements, the whole dashboard loads in one query, and the schema check on a cold start is a single query.
+
 **Free-tier notes**
 
 - Vercel caps request bodies at about 4.5 MB. The app keeps each sketch below that and uploads sketch images one at a time during imports.
-- Neon's free database pauses when idle, so the first request after a quiet period can take a second or two.
+- Neon's free database pauses after a few minutes idle, and Vercel shuts idle function instances down. The first request after a quiet period therefore takes about 1–2 s. After that, requests should be fast.
 - The login rate limit is kept in memory per function instance, so it's weaker on serverless. That's fine for personal use.
 - Vercel Hobby is for non-commercial use.
 

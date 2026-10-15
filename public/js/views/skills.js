@@ -1,5 +1,5 @@
 import { h, lastWeeks, fmtDate, round, daysAgo, sum } from '../util.js';
-import { api, store } from '../store.js';
+import { store } from '../store.js';
 import { card, chart, empty, openRecord, pageHead, progressBar, guard, linkChip, tile } from '../ui.js';
 import { weekly, byDay } from '../analytics.js';
 import { norm } from './leaderboards.js';
@@ -9,7 +9,7 @@ export default {
     const skills = [...store.list('skills')].sort((a, b) => b.level - a.level);
     const logs = store.list('skill_logs');
     let boards = [];
-    try { boards = await api('GET', '/api/leaderboards'); } catch {}
+    try { boards = await store.boards(); } catch {}
     const joined = new Set(boards.filter((b) => b.joined).map((b) => b.key));
     const weeks = lastWeeks(12);
     const top = [...skills].sort((a, b) => sum(logs.filter((l) => l.skill_id === b.id), (l) => l.minutes) - sum(logs.filter((l) => l.skill_id === a.id), (l) => l.minutes)).slice(0, 5);
@@ -35,8 +35,7 @@ export default {
             class: `sm ${isIn ? 'active' : ''}`, title: 'Opt in to rank against other users on this skill',
             onclick: async (e) => {
               e.stopPropagation();
-              await guard(() => api(isIn ? 'DELETE' : 'POST', `/api/leaderboards/${encodeURIComponent(key)}/join`), isIn ? 'Left leaderboard' : 'Joined leaderboard');
-              store.emit();
+              await guard(() => store.setBoard(key, !isIn), isIn ? 'Left leaderboard' : 'Joined leaderboard');
             },
           }, isIn ? '♛ On leaderboard' : '♛ Join leaderboard')));
     };

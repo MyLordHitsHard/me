@@ -34,7 +34,8 @@ const bad = (msg) => new HttpError(400, msg);
 
 function send(res, status, body, headers = {}) {
   const data = body === undefined ? '' : JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
+  const timing = res.startedAt ? { 'Server-Timing': `app;dur=${Date.now() - res.startedAt}` } : {};
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...timing, ...headers });
   res.end(data);
 }
 
@@ -118,11 +119,25 @@ async function createSession(db, userId) {
   return token;
 }
 
-async function currentUser(db, req) {
+// Per-instance cache of token → user id, so most requests skip the session lookup round trip.
+// Logout / password change clear it locally; other warm instances notice within SESSION_CACHE_MS.
+const SESSION_CACHE_MS = 30000;
+const sessionCache = new Map();
+function forgetSessions(match) {
+  for (const [k, v] of sessionCache) if (match(k, v)) sessionCache.delete(k);
+}
+
+async function currentUserId(db, req) {
   const token = parseCookies(req)[COOKIE];
   if (!token) return null;
-  const row = await db.get('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?', sha256(token), Date.now());
-  return row || null;
+  const hash = sha256(token);
+  const hit = sessionCache.get(hash);
+  if (hit && hit.until > Date.now()) return hit.uid;
+  const row = await db.get('SELECT user_id, expires_at FROM sessions WHERE token_hash = ? AND expires_at > ?', hash, Date.now());
+  if (!row) { sessionCache.delete(hash); return null; }
+  if (sessionCache.size > 5000) sessionCache.clear();
+  sessionCache.set(hash, { uid: row.user_id, until: Math.min(Date.now() + SESSION_CACHE_MS, Number(row.expires_at)) });
+  return row.user_id;
 }
 
 function publicUser(u) {
@@ -211,16 +226,60 @@ async function validate(db, entity, body, userId, isCreate, trustRefs = false) {
 
 const listColumns = (entity) => ['id', ...Object.entries(ENTITIES[entity].fields).filter(([, f]) => !f.heavy).map(([n]) => q(n)), 'created_at', 'updated_at'].join(', ');
 
-async function insertRow(db, entity, userId, values) {
-  const cols = Object.keys(values);
-  const r = await db.get(`INSERT INTO ${entity} (user_id${cols.map((c) => `, ${q(c)}`).join('')}) VALUES (?${cols.map(() => ', ?').join('')}) RETURNING id`, userId, ...cols.map((c) => values[c]));
-  return r.id;
+// Ownership check for every reference field, folded into the write itself (no extra round trip).
+function refGuard(entity, values, userId) {
+  const sql = [];
+  const params = [];
+  for (const [n, f] of Object.entries(ENTITIES[entity].fields)) {
+    if (f.type !== 'ref' || values[n] === undefined || values[n] === null) continue;
+    sql.push(`EXISTS (SELECT 1 FROM ${f.ref} WHERE id = ? AND user_id = ?)`);
+    params.push(values[n], userId);
+  }
+  return { sql: sql.join(' AND '), params };
 }
+async function badRef(db, entity, values, userId) {
+  for (const [n, f] of Object.entries(ENTITIES[entity].fields)) {
+    if (f.type !== 'ref' || values[n] === undefined || values[n] === null) continue;
+    if (!(await db.get(`SELECT 1 FROM ${f.ref} WHERE id = ? AND user_id = ?`, values[n], userId))) return bad(`${n} refers to an unknown ${ENTITIES[f.ref].label.toLowerCase()}`);
+  }
+  return null;
+}
+
+// Parameters in INSERT … SELECT need explicit types.
+const CAST = { text: 'text', date: 'text', enum: 'text', int: 'integer', bool: 'integer', real: 'double precision', ref: 'integer' };
+
+// INSERT … RETURNING the list columns: one round trip.
+async function createRow(db, entity, userId, values) {
+  const cols = Object.keys(values);
+  const fields = ENTITIES[entity].fields;
+  const guard = refGuard(entity, values, userId);
+  const row = await db.get(`INSERT INTO ${entity} (user_id${cols.map((c) => `, ${q(c)}`).join('')})
+    SELECT ?::integer${cols.map((c) => `, ?::${CAST[fields[c].type]}`).join('')} ${guard.sql ? `WHERE ${guard.sql}` : ''} RETURNING ${listColumns(entity)}`,
+  userId, ...cols.map((c) => values[c]), ...guard.params);
+  if (!row) throw (await badRef(db, entity, values, userId)) || bad('Invalid reference');
+  return row;
+}
+
+// Keep parents in sync when a child is logged (a practice log's level updates the skill, an interaction bumps last contact).
+const PARENT_SYNC = {
+  skill_logs: (row, uid) => (row.level === null || row.level === undefined ? null
+    : ['skills', `UPDATE skills SET level = ?, updated_at = ${NOW} WHERE id = ? AND user_id = ? RETURNING ${listColumns('skills')}`, [row.level, row.skill_id, uid]]),
+  interactions: (row, uid) => ['people', `UPDATE people SET last_contact = ?, updated_at = ${NOW} WHERE id = ? AND user_id = ? AND (last_contact IS NULL OR last_contact < ?) RETURNING ${listColumns('people')}`, [row.date, row.person_id, uid, row.date]],
+};
 
 const getRow = (db, entity, id, userId, full) => db.get(`SELECT ${full ? '*' : listColumns(entity)} FROM ${entity} WHERE id = ? AND user_id = ?`, id, userId);
 
-async function validLinkEnd(db, type, id, userId) {
-  return LINKABLE.includes(type) && Number.isInteger(id) && id > 0 && id <= 2147483647 && !!(await db.get(`SELECT 1 FROM ${type} WHERE id = ? AND user_id = ?`, id, userId));
+// Everything the client needs on load, as ONE query (each round trip to the DB costs latency).
+const BOOT_SQL = `SELECT json_build_object(
+  'user', (SELECT row_to_json(x) FROM (SELECT id, username, display_name, headline, bio, settings, created_at FROM users WHERE id = $1) x),
+  'links', COALESCE((SELECT json_agg(x ORDER BY x.id) FROM (SELECT id, from_type, from_id, to_type, to_id, label FROM links WHERE user_id = $1) x), '[]'::json),
+  ${Object.keys(ENTITIES).map((e) => `'${e}', COALESCE((SELECT json_agg(x ORDER BY x.id) FROM (SELECT ${listColumns(e)} FROM ${e} WHERE user_id = $1) x), '[]'::json)`).join(',\n  ')}
+) AS boot`;
+
+async function bootstrap(db, userId) {
+  const { boot } = (await db.query(BOOT_SQL, [userId])).rows[0]; // no '?' inside, so $1 passes through untouched
+  const { user, links, ...data } = boot;
+  return { user, links, data };
 }
 
 async function allData(db, userId, full) {
@@ -341,19 +400,26 @@ async function api(req, res, url) {
     }
     if (parts[1] === 'logout' && method === 'POST') {
       const token = parseCookies(req)[COOKIE];
-      if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
+      if (token) {
+        await db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
+        sessionCache.delete(sha256(token));
+      }
       return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
     }
     throw new HttpError(404, 'Not found');
   }
 
-  const user = await currentUser(db, req);
-  if (!user) throw new HttpError(401, 'Please log in');
-  const uid = user.id;
+  const uid = await currentUserId(db, req);
+  if (!uid) throw new HttpError(401, 'Please log in');
+  const loadUser = async () => {
+    const u = await db.get('SELECT * FROM users WHERE id = ?', uid);
+    if (!u) throw new HttpError(401, 'Please log in');
+    return u;
+  };
 
   // ---- profile
   if (parts[0] === 'me') {
-    if (parts.length === 1 && method === 'GET') return send(res, 200, publicUser(user));
+    if (parts.length === 1 && method === 'GET') return send(res, 200, publicUser(await loadUser()));
     if (parts.length === 1 && method === 'PUT') {
       const upd = {};
       if (body.display_name !== undefined) {
@@ -373,18 +439,22 @@ async function api(req, res, url) {
     }
     if (parts[1] === 'password' && method === 'PUT') {
       rateLimit(req, 'password', 10);
+      const user = await loadUser();
       if (!verifyPassword(String(body.current || '').slice(0, 1000), user.password_hash)) throw new HttpError(401, 'Current password is wrong');
       const next = String(body.next || '');
       if (next.length < 8) throw bad('New password must be at least 8 characters');
       if (next.length > 1000) throw bad('Password is too long');
       await db.run('UPDATE users SET password_hash = ? WHERE id = ?', hashPassword(next), uid);
       await db.run('DELETE FROM sessions WHERE user_id = ?', uid);
+      forgetSessions((k, v) => v.uid === uid);
       const token = await createSession(db, uid);
       return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, SESSION_DAYS * 86400) });
     }
     if (parts.length === 1 && method === 'DELETE') {
+      const user = await loadUser();
       if (!verifyPassword(String(body.password || '').slice(0, 1000), user.password_hash)) throw new HttpError(401, 'Password is wrong');
       await db.run('DELETE FROM users WHERE id = ?', uid);
+      forgetSessions((k, v) => v.uid === uid);
       return send(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
     }
     throw new HttpError(404, 'Not found');
@@ -392,10 +462,12 @@ async function api(req, res, url) {
 
   if (parts[0] === 'schema' && method === 'GET') return send(res, 200, { entities: ENTITIES, linkable: LINKABLE });
   if (parts[0] === 'bootstrap' && method === 'GET') {
-    return send(res, 200, { user: publicUser(user), ...(await allData(db, uid, false)) });
+    const boot = await bootstrap(db, uid);
+    if (!boot.user) throw new HttpError(401, 'Please log in');
+    return send(res, 200, { user: publicUser(boot.user), data: boot.data, links: boot.links, schema: { entities: ENTITIES, linkable: LINKABLE } });
   }
   if (parts[0] === 'export' && method === 'GET') {
-    const { data, links } = await allData(db, uid, true);
+    const [user, { data, links }] = await Promise.all([loadUser(), allData(db, uid, true)]);
     return send(res, 200, { app: 'lifeos', version: 1, exported_at: new Date().toISOString(), profile: publicUser(user), data, links }, {
       'Content-Disposition': `attachment; filename="lifeos-${user.username}.json"`,
     });
@@ -416,13 +488,21 @@ async function api(req, res, url) {
     if (method === 'POST' && parts.length === 1) {
       const fromId = Number(body.from_id);
       const toId = Number(body.to_id);
-      if (!(await validLinkEnd(db, body.from_type, fromId, uid)) || !(await validLinkEnd(db, body.to_type, toId, uid))) throw bad('Invalid link target');
+      const okId = (n) => Number.isInteger(n) && n > 0 && n <= 2147483647;
+      if (!LINKABLE.includes(body.from_type) || !LINKABLE.includes(body.to_type) || !okId(fromId) || !okId(toId)) throw bad('Invalid link target');
       if (body.from_type === body.to_type && fromId === toId) throw bad('Cannot link a record to itself');
-      const dup = await db.get(`SELECT id FROM links WHERE user_id = ? AND ((from_type=? AND from_id=? AND to_type=? AND to_id=?) OR (from_type=? AND from_id=? AND to_type=? AND to_id=?))`,
-        uid, body.from_type, fromId, body.to_type, toId, body.to_type, toId, body.from_type, fromId);
-      if (dup) throw new HttpError(409, 'Already linked');
       const label = body.label ? String(body.label).slice(0, 100) : null;
-      const r = await db.get('INSERT INTO links (user_id, from_type, from_id, to_type, to_id, label) VALUES (?, ?, ?, ?, ?, ?) RETURNING id', uid, body.from_type, fromId, body.to_type, toId, label);
+      const dupSql = `SELECT 1 FROM links WHERE user_id = ? AND ((from_type=? AND from_id=? AND to_type=? AND to_id=?) OR (from_type=? AND from_id=? AND to_type=? AND to_id=?))`;
+      const dupParams = [uid, body.from_type, fromId, body.to_type, toId, body.to_type, toId, body.from_type, fromId];
+      // Ownership of both ends + duplicate check + insert in one statement.
+      const r = await db.get(`INSERT INTO links (user_id, from_type, from_id, to_type, to_id, label)
+        SELECT ?::integer, ?::text, ?::integer, ?::text, ?::integer, ?::text WHERE EXISTS (SELECT 1 FROM ${body.from_type} WHERE id = ? AND user_id = ?)
+          AND EXISTS (SELECT 1 FROM ${body.to_type} WHERE id = ? AND user_id = ?) AND NOT EXISTS (${dupSql}) RETURNING id`,
+      uid, body.from_type, fromId, body.to_type, toId, label, fromId, uid, toId, uid, ...dupParams);
+      if (!r) {
+        if (await db.get(dupSql, ...dupParams)) throw new HttpError(409, 'Already linked');
+        throw bad('Invalid link target');
+      }
       return send(res, 201, { id: r.id, from_type: body.from_type, from_id: fromId, to_type: body.to_type, to_id: toId, label });
     }
     if (method === 'DELETE' && parts.length === 2) {
@@ -469,24 +549,37 @@ async function api(req, res, url) {
     return send(res, 200, row);
   }
   if (method === 'POST' && id === null) {
-    const values = await validate(db, entity, body, uid, true);
-    const newId = await insertRow(db, entity, uid, values);
-    return send(res, 201, await getRow(db, entity, newId, uid, false));
+    const values = await validate(db, entity, body, uid, true, true);
+    const row = await createRow(db, entity, uid, values);
+    const sync = PARENT_SYNC[entity] && PARENT_SYNC[entity](row, uid);
+    if (sync) {
+      const parent = await db.get(sync[1], ...sync[2]);
+      if (parent) row._parent = { type: sync[0], row: parent };
+    }
+    return send(res, 201, row);
   }
   if (method === 'PUT' && id !== null) {
-    if (!(await getRow(db, entity, id, uid, false))) throw new HttpError(404, 'Not found');
-    const values = await validate(db, entity, body, uid, false);
+    const values = await validate(db, entity, body, uid, false, true);
     const cols = Object.keys(values);
-    if (cols.length) {
-      await db.run(`UPDATE ${entity} SET ${cols.map((c) => `${q(c)} = ?`).join(', ')}, updated_at = ${NOW} WHERE id = ? AND user_id = ?`, ...cols.map((c) => values[c]), id, uid);
+    if (!cols.length) {
+      const row = await getRow(db, entity, id, uid, false);
+      if (!row) throw new HttpError(404, 'Not found');
+      return send(res, 200, row);
     }
-    return send(res, 200, await getRow(db, entity, id, uid, false));
+    const guard = refGuard(entity, values, uid);
+    const row = await db.get(`UPDATE ${entity} SET ${cols.map((c) => `${q(c)} = ?`).join(', ')}, updated_at = ${NOW}
+      WHERE id = ? AND user_id = ? ${guard.sql ? `AND ${guard.sql}` : ''} RETURNING ${listColumns(entity)}`,
+    ...cols.map((c) => values[c]), id, uid, ...guard.params);
+    if (!row) {
+      if (!(await getRow(db, entity, id, uid, false))) throw new HttpError(404, 'Not found');
+      throw (await badRef(db, entity, values, uid)) || bad('Invalid reference');
+    }
+    return send(res, 200, row);
   }
   if (method === 'DELETE' && id !== null) {
-    await db.tx(async (t) => {
-      await t.run('DELETE FROM links WHERE user_id = ? AND ((from_type = ? AND from_id = ?) OR (to_type = ? AND to_id = ?))', uid, entity, id, entity, id);
-      await t.run(`DELETE FROM ${entity} WHERE id = ? AND user_id = ?`, id, uid);
-    });
+    // One atomic statement: drop the record's links and the record (children cascade).
+    await db.run(`WITH l AS (DELETE FROM links WHERE user_id = ? AND ((from_type = ? AND from_id = ?) OR (to_type = ? AND to_id = ?)))
+      DELETE FROM ${entity} WHERE id = ? AND user_id = ?`, uid, entity, id, entity, id, id, uid);
     return send(res, 200, { ok: true });
   }
   throw new HttpError(405, 'Method not allowed');
@@ -530,11 +623,18 @@ function serveStatic(req, res, url) {
 }
 
 async function handler(req, res) {
+  res.startedAt = Date.now();
   const url = new URL(req.url, 'http://localhost');
   try {
     if (url.pathname === '/healthz' || url.pathname === '/api/healthz') {
-      await (await getDb()).get('SELECT 1 AS ok');
-      return send(res, 200, { ok: true });
+      // Also a latency check: the function and the database should be in the same region.
+      const db = await getDb();
+      await db.get('SELECT 1 AS ok');
+      const t = Date.now();
+      await db.get('SELECT 1 AS ok');
+      const host = (() => { try { return new URL(process.env.DATABASE_URL || process.env.POSTGRES_URL).hostname; } catch { return ''; } })();
+      const dbRegion = (/\.([a-z]{2}-[a-z]+-\d)\.aws\.neon\.tech$/.exec(host) || /\.([a-z0-9]+)\.azure\.neon\.tech$/.exec(host) || [])[1] || null;
+      return send(res, 200, { ok: true, functionRegion: process.env.VERCEL_REGION || null, database: db.kind, databaseRegion: dbRegion, dbRoundTripMs: Date.now() - t });
     }
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     serveStatic(req, res, url);

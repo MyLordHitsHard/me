@@ -1,5 +1,5 @@
 import { h, today, daysAgo, addDays, fmtDate, fmtNum, sum } from '../util.js';
-import { api, store } from '../store.js';
+import { store } from '../store.js';
 import { card, chart, empty, openRecord, pageHead, progressBar, guard, linkChip } from '../ui.js';
 import { AREA_LABEL } from '../analytics.js';
 import { norm } from './leaderboards.js';
@@ -9,7 +9,7 @@ export default {
     const trackers = store.list('trackers');
     const logs = store.list('tracker_logs');
     let joined = new Set();
-    try { joined = new Set((await api('GET', '/api/leaderboards')).filter((b) => b.joined).map((b) => b.key)); } catch {}
+    try { joined = new Set((await store.boards()).filter((b) => b.joined).map((b) => b.key)); } catch {}
     const days = [];
     for (let d = daysAgo(29); d <= today(); d = addDays(d, 1)) days.push(d);
 
@@ -41,7 +41,7 @@ export default {
           `30-day total ${fmtNum(total30, 1)} ${t.unit || ''}`, hit !== null ? ` · goal hit ${hit}/30 days` : '',
           h('span', { class: 'spacer' }),
           store.linksOf('trackers', t.id).map(({ type, item }) => linkChip(type, item)),
-          h('button', { class: `sm ${isIn ? 'active' : ''}`, onclick: async () => { await guard(() => api(isIn ? 'DELETE' : 'POST', `/api/leaderboards/${encodeURIComponent(key)}/join`)); store.emit(); } }, isIn ? '♛ On leaderboard' : '♛ Join leaderboard'))));
+          h('button', { class: `sm ${isIn ? 'active' : ''}`, onclick: () => guard(() => store.setBoard(key, !isIn)) }, isIn ? '♛ On leaderboard' : '♛ Join leaderboard'))));
     };
 
     return h('div', { style: { display: 'contents' } },
