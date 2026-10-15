@@ -1,0 +1,74 @@
+{
+  "app": "lifeos",
+  "version": 1,
+  "profile": {
+    "display_name": "Himanshu Dutt",
+    "headline": "B.Tech CSE (JUIT) · Full-stack (MERN) developer · Competitive programmer",
+    "bio": "Fascinated by technology since childhood. I write C, C++, Python and JavaScript, love designing websites and doing competitive programming. My greatest strength is adapting quickly to whatever the situation needs.\n\nLanguages: Hindi (native), English (professional).\nInterests: programming, gaming, sports."
+  },
+  "data": {
+    "career": [
+      { "id": 1, "title": "B.Tech, Computer Science Engineering", "kind": "education", "org": "Jaypee University of Information Technology (JUIT)", "location": "Himachal Pradesh, India", "start_date": "2020-09-01", "end_date": "2024-06-30", "status": "done", "score": "GPA 8.64 / 10", "details": "Relevant coursework: Data Structures & Algorithms, Database Systems, Operating Systems." },
+      { "id": 2, "title": "CodeChef JUIT Chapter — Member", "kind": "job", "org": "CodeChef JUIT Chapter", "start_date": "2021-10-01", "end_date": "2022-03-31", "status": "done" },
+      { "id": 3, "title": "Workout Tracker (MERN)", "kind": "project", "start_date": "2023-02-01", "end_date": "2023-03-31", "status": "done", "url": "https://github.com/MyLordHitsHard/Workout-Tracker-Frontend", "details": "Full-stack workout tracking app with MongoDB, Express, React and Node. Backend: github.com/MyLordHitsHard/Workout-Tracker-Backend" },
+      { "id": 4, "title": "CPU scheduling algorithms", "kind": "project", "start_date": "2022-03-01", "end_date": "2022-03-31", "status": "done", "details": "Implementations of FCFS, SJF, Priority and Round Robin scheduling (Operating Systems)." },
+      { "id": 5, "title": "Buddy memory allocation (C++)", "kind": "project", "status": "done", "details": "Implementation of the buddy memory allocation system in C++." },
+      { "id": 6, "title": "Banker's algorithm (C++)", "kind": "project", "status": "done", "details": "Deadlock-avoidance Banker's algorithm implemented in C++." },
+      { "id": 7, "title": "Blog site (React / Node / Express / MongoDB Atlas)", "kind": "project", "status": "done", "details": "A full-stack blog built with Node.js, Express.js, MongoDB Atlas and a React front end." },
+      { "id": 8, "title": "Online-class launcher for my batch", "kind": "project", "status": "done", "details": "One-page site showing the class timetable with one-click meeting links — faster than going through Google Classroom. Built with two friends." },
+      { "id": 9, "title": "Portfolio website", "kind": "project", "status": "done", "url": "https://portfolio-sing.onrender.com/" },
+      { "id": 10, "title": "Google Hash Code 2022 — Qualification round, rank 3001", "kind": "achievement", "org": "Google", "start_date": "2022-02-24", "status": "done", "score": "1,628,327 pts" },
+      { "id": 11, "title": "Google Kick Start 2022 Round B — rank 3742", "kind": "achievement", "org": "Google", "start_date": "2022-04-24", "status": "done" },
+      { "id": 12, "title": "CodeChef college chapter — 3rd position", "kind": "achievement", "org": "CodeChef", "start_date": "2021-06-01", "status": "done" },
+      { "id": 13, "title": "CodeChef SnackDown — Round 1B", "kind": "achievement", "org": "CodeChef", "start_date": "2021-10-01", "status": "done" },
+      { "id": 14, "title": "Google Code Jam 2021 — participant", "kind": "achievement", "org": "Google", "start_date": "2021-03-26", "status": "done" },
+      { "id": 15, "title": "CSS Bootcamp: Master CSS (Grid & Flexbox)", "kind": "certificate", "org": "Infosys Springboard", "start_date": "2022-05-01", "status": "done" },
+      { "id": 16, "title": "Introduction to Cybersecurity", "kind": "certificate", "org": "Cisco Networking Academy (Credly)", "status": "done", "url": "https://www.credly.com/badges/f0f64ec0-efb7-42a0-a287-5b4396154a3d" }
+    ],
+    "skills": [
+      { "id": 1, "name": "C++", "category": "Programming", "level": 80, "target": 90, "notes": "My \"native\" language — OS and networks algorithms, competitive programming." },
+      { "id": 2, "name": "C", "category": "Programming", "level": 70, "target": 80 },
+      { "id": 3, "name": "Python", "category": "Programming", "level": 70, "target": 85 },
+      { "id": 4, "name": "JavaScript", "category": "Programming", "level": 65, "target": 85 },
+      { "id": 5, "name": "SQL", "category": "Data", "level": 60, "target": 80 },
+      { "id": 6, "name": "React", "category": "Web", "level": 65, "target": 85 },
+      { "id": 7, "name": "Node.js / Express", "category": "Web", "level": 62, "target": 85 },
+      { "id": 8, "name": "MongoDB", "category": "Data", "level": 58, "target": 80 },
+      { "id": 9, "name": "Tailwind CSS", "category": "Web", "level": 60, "target": 75 },
+      { "id": 10, "name": "Docker", "category": "DevOps", "level": 40, "target": 70 },
+      { "id": 11, "name": "TensorFlow", "category": "ML", "level": 35, "target": 65 },
+      { "id": 12, "name": "OpenGL (GLUT)", "category": "Graphics", "level": 40, "target": 60 },
+      { "id": 13, "name": "Competitive programming", "category": "Problem solving", "level": 68, "target": 85, "notes": "Mostly LeetCode; Hash Code, Kick Start, Code Jam, SnackDown." },
+      { "id": 14, "name": "Postman / API testing", "category": "Tools", "level": 60, "target": 75 }
+    ],
+    "goals": [
+      { "id": 1, "title": "Ship LifeOS and use it daily for 30 days", "area": "personal", "status": "doing", "progress": 10 },
+      { "id": 2, "title": "Raise JavaScript & React to target level", "area": "career", "status": "doing", "progress": 30 },
+      { "id": 3, "title": "Learn Docker properly (compose, multi-stage builds)", "area": "learning", "status": "todo", "progress": 0 }
+    ],
+    "trackers": [
+      { "id": 1, "name": "LeetCode problems", "unit": "problems", "daily_goal": 2, "area": "career" }
+    ],
+    "swot_items": [
+      { "id": 1, "quadrant": "S", "text": "Adapts quickly to new situations and tech" },
+      { "id": 2, "quadrant": "S", "text": "Strong CS fundamentals: DSA, OS, DBMS" }
+    ]
+  },
+  "links": [
+    { "from_type": "career", "from_id": 3, "to_type": "skills", "to_id": 6, "label": "built with" },
+    { "from_type": "career", "from_id": 3, "to_type": "skills", "to_id": 7, "label": "built with" },
+    { "from_type": "career", "from_id": 3, "to_type": "skills", "to_id": 8, "label": "built with" },
+    { "from_type": "career", "from_id": 7, "to_type": "skills", "to_id": 6, "label": "built with" },
+    { "from_type": "career", "from_id": 7, "to_type": "skills", "to_id": 7, "label": "built with" },
+    { "from_type": "career", "from_id": 4, "to_type": "skills", "to_id": 1, "label": "written in" },
+    { "from_type": "career", "from_id": 5, "to_type": "skills", "to_id": 1, "label": "written in" },
+    { "from_type": "career", "from_id": 6, "to_type": "skills", "to_id": 1, "label": "written in" },
+    { "from_type": "career", "from_id": 10, "to_type": "skills", "to_id": 13, "label": "proves" },
+    { "from_type": "career", "from_id": 11, "to_type": "skills", "to_id": 13, "label": "proves" },
+    { "from_type": "career", "from_id": 15, "to_type": "skills", "to_id": 9, "label": "related" },
+    { "from_type": "goals", "from_id": 2, "to_type": "skills", "to_id": 4, "label": "improves" },
+    { "from_type": "goals", "from_id": 2, "to_type": "skills", "to_id": 6, "label": "improves" },
+    { "from_type": "goals", "from_id": 3, "to_type": "skills", "to_id": 10, "label": "improves" },
+    { "from_type": "trackers", "from_id": 1, "to_type": "skills", "to_id": 13, "label": "practice" }
+  ]
+}
